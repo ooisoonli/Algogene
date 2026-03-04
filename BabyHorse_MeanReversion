@@ -6,15 +6,23 @@ import talib
 class AlgoEvent:
     def __init__(self):
         self.lasttradetime = datetime(2000, 1, 1)
-        self.length = 20
-        self.mult = 2.0
-        self.hi = 100
-        self.lo = 0
 
-        # === Tuned for Gold (XAU/USD) ===
-        self.fixedSL               = 0.004   # 0.40%
-        self.trailingActivationPct = 0.003   # 0.30% activation
-        self.trailingStopPct       = 0.002   # 0.20% trailing distance
+        # === BB%B settings ===
+        self.length = 20
+        self.mult   = 2.0
+        self.hi     = 100
+        self.lo     = 0
+
+        # === ATR-based risk settings ===
+        # SL, activation and trail are all multiples of ATR
+        # ATR automatically adapts to Gold price level and volatility
+        self.atr_period     = 14    # ATR lookback period
+        self.sl_atr_mult    = 1.5   # SL = 1.5 × ATR away from entry
+        self.act_atr_mult   = 1.0   # Trailing activates after 1.0 × ATR in profit
+        self.trail_atr_mult = 0.5   # Trail distance = 0.5 × ATR behind peak
+
+        # === EMA200 trend filter ===
+        self.ema_period = 200       # Daily EMA200 for macro trend direction
 
         self.myinstrument   = None
         self.open_positions = {}
@@ -34,68 +42,117 @@ class AlgoEvent:
             self.lasttradetime = now
 
             lastprice = bd[self.myinstrument]['lastPrice']
-
-            # ✅ Guard: skip if price is invalid
             if not lastprice or lastprice <= 0:
                 return
 
-            bars = self.evt.getHistoricalBar(
-                {"instrument": self.myinstrument}, self.length + 5, 'H'
+            # ─────────────────────────────────────────
+            # 1. Fetch Daily bars for EMA200 trend filter
+            # ─────────────────────────────────────────
+            bars_D = self.evt.getHistoricalBar(
+                {"instrument": self.myinstrument}, self.ema_period + 5, 'D'
             )
-
-            # ✅ Stricter bar check
-            if not bars or len(bars) < self.length + 2:
+            if not bars_D or len(bars_D) < self.ema_period:
                 return
 
-            sorted_keys = sorted(bars)
-            closes = np.array([bars[t]['c'] for t in sorted_keys], dtype=float)
+            sorted_D   = sorted(bars_D)
+            closes_D   = np.array([bars_D[t]['c'] for t in sorted_D], dtype=float)
 
-            # ✅ Guard: skip if any close is zero or NaN
-            if np.any(np.isnan(closes)) or np.any(closes <= 0):
+            if np.any(np.isnan(closes_D)) or np.any(closes_D <= 0):
                 return
 
-            # === Bollinger Band %B ===
-            basis = talib.EMA(closes, timeperiod=self.length)
-            dev   = self.mult * talib.STDDEV(closes, timeperiod=self.length, nbdev=1)
+            ema200     = talib.EMA(closes_D, timeperiod=self.ema_period)
+            ema200_val = ema200[-1]
+
+            if np.isnan(ema200_val):
+                return
+
+            # Macro trend direction
+            bullTrend = lastprice > ema200_val   # Price above EMA200 = bull
+            bearTrend = lastprice < ema200_val   # Price below EMA200 = bear
+
+            # ─────────────────────────────────────────
+            # 2. Fetch H1 bars for BB%B + ATR
+            # ─────────────────────────────────────────
+            bars_H = self.evt.getHistoricalBar(
+                {"instrument": self.myinstrument}, self.length + 20, 'H'
+            )
+            if not bars_H or len(bars_H) < self.length + 5:
+                return
+
+            sorted_H = sorted(bars_H)
+            high_H   = np.array([bars_H[t]['h'] for t in sorted_H], dtype=float)
+            low_H    = np.array([bars_H[t]['l'] for t in sorted_H], dtype=float)
+            close_H  = np.array([bars_H[t]['c'] for t in sorted_H], dtype=float)
+
+            if np.any(np.isnan(close_H)) or np.any(close_H <= 0):
+                return
+
+            # === BB%B ===
+            basis = talib.EMA(close_H, timeperiod=self.length)
+            dev   = self.mult * talib.STDDEV(close_H, timeperiod=self.length, nbdev=1)
             upper = basis + dev
             lower = basis - dev
 
-            # ✅ Guard: avoid division by zero when bands collapse
             band_width = upper[-1] - lower[-1]
             if band_width <= 0:
                 return
 
-            bbpct = (closes - lower) / (upper - lower) * 100
+            bbpct = (close_H - lower) / (upper - lower) * 100
 
-            # ✅ Check both last two bars are valid
             if np.isnan(bbpct[-1]) or np.isnan(bbpct[-2]):
                 return
 
-            # === Entry Signals ===
+            # === ATR (H1) ===
+            atr_arr = talib.ATR(high_H, low_H, close_H, timeperiod=self.atr_period)
+            atr_val = atr_arr[-2]   # use confirmed bar
+
+            if np.isnan(atr_val) or atr_val <= 0:
+                return
+
+            # === BB%B Signals ===
             reboundLong  = bbpct[-2] < self.lo and bbpct[-1] > self.lo
             reboundShort = bbpct[-2] > self.hi and bbpct[-1] < self.hi
 
-            # ✅ Reduce console log frequency — only log on signals to avoid crash
-            if reboundLong or reboundShort:
+            # === EMA200 Filter — only trade WITH the macro trend ===
+            # Long signal only allowed when price > EMA200 (bull market)
+            # Short signal only allowed when price < EMA200 (bear market)
+            longOK  = reboundLong  and bullTrend
+            shortOK = reboundShort and bearTrend
+
+            if longOK or shortOK:
                 self.evt.consoleLog(
                     f"[{now.strftime('%Y-%m-%d %H:%M')}] "
-                    f"BB%={bbpct[-1]:.1f} | Price={lastprice:.2f} | "
-                    f"Signal={'LONG' if reboundLong else 'SHORT'}"
+                    f"BB%={bbpct[-1]:.1f} | ATR={atr_val:.2f} | "
+                    f"EMA200={ema200_val:.2f} | Price={lastprice:.2f} | "
+                    f"Signal={'LONG' if longOK else 'SHORT'} ✅"
                 )
+            else:
+                # Log filtered signals so we can see what's being blocked
+                if reboundLong or reboundShort:
+                    self.evt.consoleLog(
+                        f"[{now.strftime('%Y-%m-%d %H:%M')}] "
+                        f"⛔ {'LONG' if reboundLong else 'SHORT'} blocked — "
+                        f"Price={'above' if bullTrend else 'below'} EMA200 "
+                        f"({lastprice:.2f} vs {ema200_val:.2f})"
+                    )
 
             if len(self.open_positions) > 0:
                 return
 
-            if reboundLong:
-                self.sendOrder(lastprice, 1, 'open')
-            elif reboundShort:
-                self.sendOrder(lastprice, -1, 'open')
+            if longOK:
+                self.sendOrder(lastprice, 1, 'open', atr_val)
+            elif shortOK:
+                self.sendOrder(lastprice, -1, 'open', atr_val)
 
         except Exception as e:
             self.evt.consoleLog(f"⚠️ on_bulkdatafeed error: {str(e)}")
 
-    def sendOrder(self, price, buysell, openclose):
+    def sendOrder(self, price, buysell, openclose, atr_val):
         try:
+            sl_dist    = self.sl_atr_mult   * atr_val   # e.g. 1.5 × ATR
+            act_dist   = self.act_atr_mult  * atr_val   # e.g. 1.0 × ATR
+            trail_pct  = (self.trail_atr_mult * atr_val) / price  # convert to % for platform
+
             order = AlgoAPIUtil.OrderObject()
             order.instrument = self.myinstrument
             order.orderRef   = 1
@@ -104,19 +161,20 @@ class AlgoEvent:
             order.buysell    = buysell
             order.ordertype  = 0  # Market order
 
-            if buysell == 1:
-                order.stopLossLevel      = price * (1 - self.fixedSL)
-                order.trailingActivation = price * (1 + self.trailingActivationPct)
-            else:
-                order.stopLossLevel      = price * (1 + self.fixedSL)
-                order.trailingActivation = price * (1 - self.trailingActivationPct)
+            if buysell == 1:   # BUY
+                order.stopLossLevel      = price - sl_dist
+                order.trailingActivation = price + act_dist
+            else:              # SELL
+                order.stopLossLevel      = price + sl_dist
+                order.trailingActivation = price - act_dist
 
-            order.trailingStop = price * self.trailingStopPct
+            order.trailingStop = trail_pct
 
             self.evt.consoleLog(
                 f"📤 {'BUY' if buysell == 1 else 'SELL'} @ {price:.2f} "
-                f"| SL={order.stopLossLevel:.2f} "
-                f"| Trail activates @ {order.trailingActivation:.2f}"
+                f"| SL={order.stopLossLevel:.2f} (${sl_dist:.1f}) "
+                f"| Trail activates @ {order.trailingActivation:.2f} "
+                f"| Trail dist=${self.trail_atr_mult * atr_val:.1f}"
             )
             self.evt.sendOrder(order)
 
