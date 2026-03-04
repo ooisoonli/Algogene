@@ -1,0 +1,83 @@
+
+from AlgoAPI import AlgoAPIUtil, AlgoAPI_Backtest
+from datetime import datetime, timedelta
+import numpy as np
+import talib
+
+class AlgoEvent:
+    def __init__(self):
+        self.lasttradetime = datetime(2000, 1, 1)
+        self.length = 20
+        self.mult = 2.0
+        self.hi = 100
+        self.lo = 0
+        self.fixedSL = 0.0015               # 50 pip stop loss
+        self.trailingActivationPct = 0.0012 # 40 pip activation
+        self.trailingStopPct = 0.0009       # 30 pip trailing
+        self.myinstrument = None
+        self.open_positions = {}
+
+    def start(self, mEvt):
+        self.myinstrument = mEvt['subscribeList'][0]
+        self.evt = AlgoAPI_Backtest.AlgoEvtHandler(self, mEvt)
+        self.evt.start()
+
+    def on_bulkdatafeed(self, isSync, bd, ab):
+        now = bd[self.myinstrument]['timestamp']
+        if now < self.lasttradetime + timedelta(hours=1):
+            return
+        self.lasttradetime = now
+
+        lastprice = bd[self.myinstrument]['lastPrice']
+        bars = self.evt.getHistoricalBar({"instrument": self.myinstrument}, self.length + 2, 'H')
+        if not bars or len(bars) < self.length + 2:
+            return
+
+        sorted_keys = sorted(bars)
+        closes = np.array([bars[t]['c'] for t in sorted_keys])
+        basis = talib.EMA(closes, timeperiod=self.length)
+        dev = self.mult * talib.STDDEV(closes, timeperiod=self.length, nbdev=1)
+        upper = basis + dev
+        lower = basis - dev
+        bbpct = (closes - lower) / (upper - lower) * 100
+
+        if np.isnan(bbpct[-1]) or np.isnan(bbpct[-2]):
+            return
+
+        # Flipped Entry Logic: Trend Following
+        reboundLong = bbpct[-2] < self.lo and bbpct[-1] > self.lo        # Oversold rebound
+        reboundShort = bbpct[-2] > self.hi and bbpct[-1] < self.hi       # Overbought reversal
+
+        if len(self.open_positions) > 0:
+            return
+
+        if reboundLong:
+            self.sendOrder(lastprice, 1, 'open')  # BUY
+        elif reboundShort:
+            self.sendOrder(lastprice, -1, 'open')  # SELL
+
+    def sendOrder(self, price, buysell, openclose):
+        order = AlgoAPIUtil.OrderObject()
+        order.instrument = self.myinstrument
+        order.orderRef = 1
+        order.volume = 0.2
+        order.openclose = openclose
+        order.buysell = buysell
+        order.ordertype = 0  # Market order
+
+        if buysell == 1:
+            order.stopLossLevel = price * (1 - self.fixedSL)
+            order.trailingActivation = price * (1 + self.trailingActivationPct)
+        else:
+            order.stopLossLevel = price * (1 + self.fixedSL)
+            order.trailingActivation = price * (1 - self.trailingActivationPct)
+
+        order.trailingStop = price * self.trailingStopPct
+
+        self.evt.consoleLog("📤 Breakout Entry:", f"{'BUY' if buysell == 1 else 'SELL'} @ {price:.2f}")
+        self.evt.sendOrder(order)
+
+    def on_openPositionfeed(self, op, oo, uo):
+        self.open_positions = oo
+
+
