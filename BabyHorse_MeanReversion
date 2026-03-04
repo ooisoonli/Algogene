@@ -1,4 +1,3 @@
-
 from AlgoAPI import AlgoAPIUtil, AlgoAPI_Backtest
 from datetime import datetime, timedelta
 import numpy as np
@@ -11,10 +10,13 @@ class AlgoEvent:
         self.mult = 2.0
         self.hi = 100
         self.lo = 0
-        self.fixedSL = 0.0015               # 50 pip stop loss
-        self.trailingActivationPct = 0.0012 # 40 pip activation
-        self.trailingStopPct = 0.0009       # 30 pip trailing
-        self.myinstrument = None
+
+        # === Tuned for Gold (XAU/USD) ===
+        self.fixedSL               = 0.004   # 0.40%
+        self.trailingActivationPct = 0.003   # 0.30% activation
+        self.trailingStopPct       = 0.002   # 0.20% trailing distance
+
+        self.myinstrument   = None
         self.open_positions = {}
 
     def start(self, mEvt):
@@ -23,61 +25,122 @@ class AlgoEvent:
         self.evt.start()
 
     def on_bulkdatafeed(self, isSync, bd, ab):
-        now = bd[self.myinstrument]['timestamp']
-        if now < self.lasttradetime + timedelta(hours=1):
-            return
-        self.lasttradetime = now
+        try:
+            now = bd[self.myinstrument]['timestamp']
 
-        lastprice = bd[self.myinstrument]['lastPrice']
-        bars = self.evt.getHistoricalBar({"instrument": self.myinstrument}, self.length + 2, 'H')
-        if not bars or len(bars) < self.length + 2:
-            return
+            # ✅ Throttle: once per hour
+            if now < self.lasttradetime + timedelta(hours=1):
+                return
+            self.lasttradetime = now
 
-        sorted_keys = sorted(bars)
-        closes = np.array([bars[t]['c'] for t in sorted_keys])
-        basis = talib.EMA(closes, timeperiod=self.length)
-        dev = self.mult * talib.STDDEV(closes, timeperiod=self.length, nbdev=1)
-        upper = basis + dev
-        lower = basis - dev
-        bbpct = (closes - lower) / (upper - lower) * 100
+            lastprice = bd[self.myinstrument]['lastPrice']
 
-        if np.isnan(bbpct[-1]) or np.isnan(bbpct[-2]):
-            return
+            # ✅ Guard: skip if price is invalid
+            if not lastprice or lastprice <= 0:
+                return
 
-        # Flipped Entry Logic: Trend Following
-        reboundLong = bbpct[-2] < self.lo and bbpct[-1] > self.lo        # Oversold rebound
-        reboundShort = bbpct[-2] > self.hi and bbpct[-1] < self.hi       # Overbought reversal
+            bars = self.evt.getHistoricalBar(
+                {"instrument": self.myinstrument}, self.length + 5, 'H'
+            )
 
-        if len(self.open_positions) > 0:
-            return
+            # ✅ Stricter bar check
+            if not bars or len(bars) < self.length + 2:
+                return
 
-        if reboundLong:
-            self.sendOrder(lastprice, 1, 'open')  # BUY
-        elif reboundShort:
-            self.sendOrder(lastprice, -1, 'open')  # SELL
+            sorted_keys = sorted(bars)
+            closes = np.array([bars[t]['c'] for t in sorted_keys], dtype=float)
+
+            # ✅ Guard: skip if any close is zero or NaN
+            if np.any(np.isnan(closes)) or np.any(closes <= 0):
+                return
+
+            # === Bollinger Band %B ===
+            basis = talib.EMA(closes, timeperiod=self.length)
+            dev   = self.mult * talib.STDDEV(closes, timeperiod=self.length, nbdev=1)
+            upper = basis + dev
+            lower = basis - dev
+
+            # ✅ Guard: avoid division by zero when bands collapse
+            band_width = upper[-1] - lower[-1]
+            if band_width <= 0:
+                return
+
+            bbpct = (closes - lower) / (upper - lower) * 100
+
+            # ✅ Check both last two bars are valid
+            if np.isnan(bbpct[-1]) or np.isnan(bbpct[-2]):
+                return
+
+            # === Entry Signals ===
+            reboundLong  = bbpct[-2] < self.lo and bbpct[-1] > self.lo
+            reboundShort = bbpct[-2] > self.hi and bbpct[-1] < self.hi
+
+            # ✅ Reduce console log frequency — only log on signals to avoid crash
+            if reboundLong or reboundShort:
+                self.evt.consoleLog(
+                    f"[{now.strftime('%Y-%m-%d %H:%M')}] "
+                    f"BB%={bbpct[-1]:.1f} | Price={lastprice:.2f} | "
+                    f"Signal={'LONG' if reboundLong else 'SHORT'}"
+                )
+
+            if len(self.open_positions) > 0:
+                return
+
+            if reboundLong:
+                self.sendOrder(lastprice, 1, 'open')
+            elif reboundShort:
+                self.sendOrder(lastprice, -1, 'open')
+
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ on_bulkdatafeed error: {str(e)}")
 
     def sendOrder(self, price, buysell, openclose):
-        order = AlgoAPIUtil.OrderObject()
-        order.instrument = self.myinstrument
-        order.orderRef = 1
-        order.volume = 0.2
-        order.openclose = openclose
-        order.buysell = buysell
-        order.ordertype = 0  # Market order
+        try:
+            order = AlgoAPIUtil.OrderObject()
+            order.instrument = self.myinstrument
+            order.orderRef   = 1
+            order.volume     = 0.2
+            order.openclose  = openclose
+            order.buysell    = buysell
+            order.ordertype  = 0  # Market order
 
-        if buysell == 1:
-            order.stopLossLevel = price * (1 - self.fixedSL)
-            order.trailingActivation = price * (1 + self.trailingActivationPct)
-        else:
-            order.stopLossLevel = price * (1 + self.fixedSL)
-            order.trailingActivation = price * (1 - self.trailingActivationPct)
+            if buysell == 1:
+                order.stopLossLevel      = price * (1 - self.fixedSL)
+                order.trailingActivation = price * (1 + self.trailingActivationPct)
+            else:
+                order.stopLossLevel      = price * (1 + self.fixedSL)
+                order.trailingActivation = price * (1 - self.trailingActivationPct)
 
-        order.trailingStop = price * self.trailingStopPct
+            order.trailingStop = price * self.trailingStopPct
 
-        self.evt.consoleLog("📤 Breakout Entry:", f"{'BUY' if buysell == 1 else 'SELL'} @ {price:.2f}")
-        self.evt.sendOrder(order)
+            self.evt.consoleLog(
+                f"📤 {'BUY' if buysell == 1 else 'SELL'} @ {price:.2f} "
+                f"| SL={order.stopLossLevel:.2f} "
+                f"| Trail activates @ {order.trailingActivation:.2f}"
+            )
+            self.evt.sendOrder(order)
+
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ sendOrder error: {str(e)}")
 
     def on_openPositionfeed(self, op, oo, uo):
-        self.open_positions = oo
+        try:
+            self.open_positions = oo
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ on_openPositionfeed error: {str(e)}")
 
-
+    # Required stubs
+    def on_marketdatafeed(self, md, ab):
+        pass
+    def on_newsdatafeed(self, nd):
+        pass
+    def on_weatherdatafeed(self, wd):
+        pass
+    def on_econsdatafeed(self, ed):
+        pass
+    def on_corpAnnouncement(self, ca):
+        pass
+    def on_orderfeed(self, of):
+        pass
+    def on_dailyPLfeed(self, pl):
+        pass
