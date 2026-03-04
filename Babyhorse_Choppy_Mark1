@@ -1,0 +1,267 @@
+from AlgoAPI import AlgoAPIUtil, AlgoAPI_Backtest
+from datetime import datetime, timedelta
+import numpy as np
+import talib
+
+class AlgoEvent:
+    def __init__(self):
+        self.lasttradetime = datetime(2000, 1, 1)
+
+        # === RSI settings ===
+        # Period 3 — fast, sensitive, fires more in choppy conditions
+        self.rsi_period    = 3
+        self.rsi_oversold  = 20
+        self.rsi_overbought= 80
+
+        # === Stochastic settings ===
+        self.stoch_k       = 5
+        self.stoch_d       = 3
+        self.stoch_smooth  = 3
+        self.stoch_oversold  = 20
+        self.stoch_overbought= 80
+
+        # === ADX gate — only trade when market is ranging ===
+        self.adx_period    = 14
+        self.adx_threshold = 25   # ADX < 25 = ranging = Strategy B active
+
+        # === ATR-based exits (fixed TP, no trailing) ===
+        self.atr_period    = 14
+        self.sl_atr_mult   = 1.0
+        self.tp_atr_mult   = 1.5
+
+        # === Session filter (same as Strategy A) ===
+        self.session_start = 8    # 8am UTC
+        self.session_end   = 21   # 9pm UTC
+
+        # === Diagnostics ===
+        self.diag = {
+            "signals_long"       : 0,
+            "signals_short"      : 0,
+            "blocked_adx"        : 0,   # ADX too high — trending, skip
+            "blocked_session"    : 0,
+            "passed_long"        : 0,
+            "passed_short"       : 0,
+            "skipped_in_trade"   : 0,
+            "monthly_signals"    : {},
+            "monthly_blocked"    : {},
+        }
+
+        self.myinstrument   = None
+        self.open_positions = {}
+
+    def start(self, mEvt):
+        self.myinstrument = mEvt['subscribeList'][0]
+        self.evt = AlgoAPI_Backtest.AlgoEvtHandler(self, mEvt)
+        self.evt.start()
+
+    def on_bulkdatafeed(self, isSync, bd, ab):
+        try:
+            now = bd[self.myinstrument]['timestamp']
+
+            # Throttle — once per hour
+            if now < self.lasttradetime + timedelta(hours=1):
+                return
+            self.lasttradetime = now
+
+            lastprice = bd[self.myinstrument]['lastPrice']
+            if not lastprice or lastprice <= 0:
+                return
+
+            month_key = now.strftime('%Y-%m')
+
+            # ── Fetch H1 bars ──
+            # Need enough for: RSI(3) + Stoch(5,3,3) + ADX(14) + ATR(14)
+            # Max period = 14, add buffer → 30 bars plenty
+            bars_H = self.evt.getHistoricalBar(
+                {"instrument": self.myinstrument}, 40, 'H'
+            )
+            if not bars_H or len(bars_H) < 30:
+                return
+
+            sorted_H = sorted(bars_H)
+            high_H   = np.array([bars_H[t]['h'] for t in sorted_H], dtype=float)
+            low_H    = np.array([bars_H[t]['l'] for t in sorted_H], dtype=float)
+            close_H  = np.array([bars_H[t]['c'] for t in sorted_H], dtype=float)
+
+            if np.any(np.isnan(close_H)) or np.any(close_H <= 0):
+                return
+
+            # === RSI(3) ===
+            rsi = talib.RSI(close_H, timeperiod=self.rsi_period)
+            if np.isnan(rsi[-1]) or np.isnan(rsi[-2]):
+                return
+
+            # === Stochastic(5,3,3) ===
+            stoch_k, stoch_d = talib.STOCH(
+                high_H, low_H, close_H,
+                fastk_period=self.stoch_k,
+                slowk_period=self.stoch_d,
+                slowk_matype=0,
+                slowd_period=self.stoch_smooth,
+                slowd_matype=0
+            )
+            if np.isnan(stoch_k[-1]) or np.isnan(stoch_k[-2]):
+                return
+
+            # === ADX(14) — ranging gate ===
+            adx = talib.ADX(high_H, low_H, close_H, timeperiod=self.adx_period)
+            if np.isnan(adx[-1]):
+                return
+            adx_val = adx[-1]
+
+            # === ATR(14) ===
+            atr_arr = talib.ATR(high_H, low_H, close_H, timeperiod=self.atr_period)
+            atr_val = atr_arr[-2]
+            if np.isnan(atr_val) or atr_val <= 0:
+                return
+
+            # === Raw signals ===
+            # BUY: RSI crosses back above oversold AND Stoch crosses back above oversold
+            rsi_buy    = rsi[-2]    < self.rsi_oversold   and rsi[-1]    > self.rsi_oversold
+            stoch_buy  = stoch_k[-2] < self.stoch_oversold and stoch_k[-1] > self.stoch_oversold
+
+            # SELL: RSI crosses back below overbought AND Stoch crosses back below overbought
+            rsi_sell   = rsi[-2]    > self.rsi_overbought  and rsi[-1]    < self.rsi_overbought
+            stoch_sell = stoch_k[-2] > self.stoch_overbought and stoch_k[-1] < self.stoch_overbought
+
+            # Double confirmation required — both RSI and Stoch must agree
+            reboundLong  = rsi_buy  and stoch_buy
+            reboundShort = rsi_sell and stoch_sell
+
+            # No signal — exit immediately
+            if not reboundLong and not reboundShort:
+                return
+
+            # Track raw signals
+            if reboundLong:
+                self.diag["signals_long"] += 1
+                self.diag["monthly_signals"][month_key] = \
+                    self.diag["monthly_signals"].get(month_key, 0) + 1
+            if reboundShort:
+                self.diag["signals_short"] += 1
+                self.diag["monthly_signals"][month_key] = \
+                    self.diag["monthly_signals"].get(month_key, 0) + 1
+
+            # === Filter 1 — Session ===
+            in_session = self.session_start <= now.hour < self.session_end
+            if not in_session:
+                self.diag["blocked_session"] += 1
+                self.diag["monthly_blocked"][month_key] = \
+                    self.diag["monthly_blocked"].get(month_key, 0) + 1
+                self.evt.consoleLog(
+                    f"🌙 [{now.strftime('%Y-%m-%d %H:%M')}] "
+                    f"{'LONG' if reboundLong else 'SHORT'} blocked — "
+                    f"outside session (hour={now.hour} UTC)"
+                )
+                return
+
+            # === Filter 2 — ADX gate (only trade when ranging) ===
+            if adx_val >= self.adx_threshold:
+                self.diag["blocked_adx"] += 1
+                self.diag["monthly_blocked"][month_key] = \
+                    self.diag["monthly_blocked"].get(month_key, 0) + 1
+                self.evt.consoleLog(
+                    f"📈 [{now.strftime('%Y-%m-%d %H:%M')}] "
+                    f"{'LONG' if reboundLong else 'SHORT'} blocked — "
+                    f"ADX={adx_val:.1f} (trending, Strategy B sits out)"
+                )
+                return
+
+            # Already in trade
+            if len(self.open_positions) > 0:
+                self.diag["skipped_in_trade"] += 1
+                return
+
+            # === Place order ===
+            if reboundLong:
+                self.diag["passed_long"] += 1
+                self.sendOrder(lastprice, 1, 'open', atr_val)
+            elif reboundShort:
+                self.diag["passed_short"] += 1
+                self.sendOrder(lastprice, -1, 'open', atr_val)
+
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ bulkfeed error: {str(e)}")
+
+    def sendOrder(self, price, buysell, openclose, atr_val):
+        try:
+            sl_dist = self.sl_atr_mult * atr_val
+            tp_dist = self.tp_atr_mult * atr_val
+
+            order = AlgoAPIUtil.OrderObject()
+            order.instrument = self.myinstrument
+            order.orderRef   = 1
+            order.volume     = 0.2
+            order.openclose  = openclose
+            order.buysell    = buysell
+            order.ordertype  = 0
+
+            if buysell == 1:
+                order.stopLossLevel   = price - sl_dist
+                order.takeProfitLevel = price + tp_dist
+            else:
+                order.stopLossLevel   = price + sl_dist
+                order.takeProfitLevel = price - tp_dist
+
+            # No trailing — fixed TP for choppy market
+            order.trailingStop = 0
+
+            self.evt.consoleLog(
+                f"✅ [B] {'BUY' if buysell == 1 else 'SELL'} @ {price:.2f} "
+                f"| SL={order.stopLossLevel:.2f} (${sl_dist:.1f}) "
+                f"| TP={order.takeProfitLevel:.2f} (${tp_dist:.1f}) "
+                f"| ATR={atr_val:.2f} | RRR=1:1.5"
+            )
+            self.evt.sendOrder(order)
+
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ sendOrder error: {str(e)}")
+
+    def on_openPositionfeed(self, op, oo, uo):
+        try:
+            self.open_positions = oo
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ positionfeed error: {str(e)}")
+
+    def on_dailyPLfeed(self, pl):
+        try:
+            now = self.lasttradetime
+            if now.day == 1:
+                d = self.diag
+                total_sig  = d["signals_long"]  + d["signals_short"]
+                total_blk  = d["blocked_adx"]   + d["blocked_session"]
+                total_pass = d["passed_long"]   + d["passed_short"]
+                blk_rate   = (total_blk / total_sig * 100) if total_sig > 0 else 0
+
+                self.evt.consoleLog("=" * 60)
+                self.evt.consoleLog(f"📊 [B] DIAG {now.strftime('%Y-%m-%d')}")
+                self.evt.consoleLog(f"   Raw signals    : {total_sig} (L:{d['signals_long']} S:{d['signals_short']})")
+                self.evt.consoleLog(f"   Blocked session: {d['blocked_session']}")
+                self.evt.consoleLog(f"   Blocked ADX    : {d['blocked_adx']} ({blk_rate:.0f}% of total)")
+                self.evt.consoleLog(f"   Passed → trades: {total_pass} (L:{d['passed_long']} S:{d['passed_short']})")
+                self.evt.consoleLog(f"   Skipped in trade: {d['skipped_in_trade']}")
+                self.evt.consoleLog("   Monthly breakdown (last 6):")
+                for m in sorted(d["monthly_signals"].keys())[-6:]:
+                    sig = d["monthly_signals"].get(m, 0)
+                    blk = d["monthly_blocked"].get(m, 0)
+                    pas = sig - blk
+                    self.evt.consoleLog(
+                        f"   {m}: {sig} signals | {blk} blocked | {pas} passed"
+                    )
+                self.evt.consoleLog("=" * 60)
+        except Exception as e:
+            self.evt.consoleLog(f"⚠️ dailyPL error: {str(e)}")
+
+    # Required stubs
+    def on_marketdatafeed(self, md, ab):
+        pass
+    def on_newsdatafeed(self, nd):
+        pass
+    def on_weatherdatafeed(self, wd):
+        pass
+    def on_econsdatafeed(self, ed):
+        pass
+    def on_corpAnnouncement(self, ca):
+        pass
+    def on_orderfeed(self, of):
+        pass
